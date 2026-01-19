@@ -1,12 +1,16 @@
 # Solar2MQTT
 
 # Features:
+not yet uploaded. This is my first Github Project
+toDO:
 - Due to many crashes after Minutes to Days I am trying the following changes:
-- NEW: LiveData only via JSON on MQTT
+- NEW: LiveData reduced only to JSON via MQTT (
 - NEW: 24h Auto Reboot
-- NEW: Refresh of Data on WebInterface only when logged in
+- NEW: Refresh of Data on WebInterface only when logged in (save resources)
 - NEW: !!Homeassistant needs to be tested. Not sure if it works correctly
  --------------
+Thanx for the great work of softwarecrash! 
+ 
 - captive portal for wifi and MQTT config
 - config in webinterface
 - Full Controll with [Custom commands](https://github.com/softwarecrash/Solar2MQTT/wiki/Set-parameters)
