@@ -1,6 +1,8 @@
 
 /*
-Solar2MQTT Project
+Solar2MQTT Project - Modified by AndyMuc72 (JSON, more stability)
+https://github.com/AndyMuc72/Solar2MQTT
+original project by softwarecrash
 https://github.com/softwarecrash/Solar2MQTT
 */
 
@@ -30,6 +32,17 @@ AsyncWebSocketClient *wsClient;
 DNSServer dns;
 Settings settings;
 
+// --- WebSocket Auto-Off ---
+bool websocketEnabled = false;
+unsigned long websocketStart = 0;
+const unsigned long WS_TIMEOUT = 30000; // 30 Sekunden
+const uint32_t MIN_HEAP = 5000;
+
+// --- 24h Reboot ---
+unsigned long bootTime = 0;
+const unsigned long DAILY_REBOOT = 24UL * 60UL * 60UL * 1000UL;
+
+
 #ifdef TEMPSENS_PIN
 OneWire oneWire(TEMPSENS_PIN);
 DallasTemperature tempSens(&oneWire);
@@ -42,6 +55,9 @@ uint8_t numOfTempSens;
 // new importetd
 char mqttClientId[80];
 ADC_MODE(ADC_VCC);
+
+
+
 
 // flag for saving data
 unsigned long mqtttimer = 0;
@@ -60,10 +76,13 @@ String commandFromUser;
 String customResponse;
 
 bool firstPublish;
-JsonDocument Json; // main Json
-JsonObject deviceJson = Json["EspData"].to<JsonObject>();    // basic device data
-JsonObject staticData = Json["DeviceData"].to<JsonObject>(); // battery package data
-JsonObject liveData = Json["LiveData"].to<JsonObject>();     // battery package data
+#include <ArduinoJson.h>
+
+StaticJsonDocument<2048> Json;   // ggf. 3072, wenn HA sehr viel Daten hat
+JsonObject deviceJson = Json["EspData"].to<JsonObject>();
+JsonObject staticData = Json["DeviceData"].to<JsonObject>();
+JsonObject liveData   = Json["LiveData"].to<JsonObject>();
+
 
 //----------------------------------------------------------------------
 void saveConfigCallback()
@@ -74,22 +93,34 @@ void saveConfigCallback()
 
 void notifyClients()
 {
-  if (wsClient != nullptr && wsClient->canSend())
+  if (!websocketEnabled)
+    return;
+
+  if (wsClient == nullptr || !wsClient->canSend())
+    return;
+
+  // erst jetzt: Aktivität
+  websocketStart = millis();
+
+  size_t len = measureJson(liveData);
+  AsyncWebSocketMessageBuffer *buffer = ws.makeBuffer(len);
+  if (buffer)
   {
-    size_t len = measureJson(liveData);
-    AsyncWebSocketMessageBuffer *buffer = ws.makeBuffer(len);
-    if (buffer)
-    {
-      serializeJson(liveData, (char *)buffer->get(), len + 1);
-      wsClient->text(buffer);
-    }
-    writeLog("WS data send");
+    serializeJson(liveData, (char *)buffer->get(), len + 1);
+    wsClient->text(buffer);
   }
 }
 
+
+
 void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
 {
+  // GUI ist aktiv → Timeout zurücksetzen
+  websocketStart = millis();
+
   AwsFrameInfo *info = (AwsFrameInfo *)arg;
+
+
   if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT)
   {
     data[len] = 0;
@@ -101,14 +132,19 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
   switch (type)
   {
   case WS_EVT_CONNECT:
-    wsClient = client;
-    getJsonData();
-    notifyClients();
-    break;
+      wsClient = client;
+      websocketEnabled = true;
+      websocketStart = millis();
+      getJsonData();
+      notifyClients();
+      break;
+
   case WS_EVT_DISCONNECT:
     wsClient = nullptr;
-    ws.cleanupClients(); // clean unused client connections
+    websocketEnabled = false;   // <-- wichtig
+    ws.cleanupClients();
     break;
+
   case WS_EVT_DATA:
     handleWebSocketMessage(arg, data, len);
     break;
@@ -170,8 +206,14 @@ bool resetCounter(bool count)
 
 void setup()
 {
+  
+  
   // make a compatibility mode for some crap routers?
   //WiFi.setPhyMode(WIFI_PHY_MODE_11G);
+  
+  // --- 24h Reboot ---
+  bootTime = millis();
+
   analogWrite(LED_PIN, 0);
 #ifdef isUART_HARDWARE
   analogWrite(LED_COM, 0);
@@ -447,12 +489,28 @@ void setup()
 void loop()
 {
   MDNS.update();
+  if (millis() - bootTime > DAILY_REBOOT)
+  {
+      writeLog("Daily reboot");
+      ESP.restart();
+  }
+
+  if (websocketEnabled && millis() - websocketStart > WS_TIMEOUT)
+  {
+      websocketEnabled = false;
+      ws.closeAll();
+      writeLog("WebSocket auto-off");
+  }
+
   if (Update.isRunning())
   {
     workerCanRun = false; // lockout, atfer true need reboot
   }
   if (workerCanRun)
   {
+    mqttclient.loop();
+    yield();
+    
     // Make sure wifi is in the right mode
     if (WiFi.status() == WL_CONNECTED)
     { // No use going to next step unless WIFI is up and running.
@@ -464,7 +522,7 @@ void loop()
       }
       ws.cleanupClients(); // clean unused client connections
       mppClient.loop(); // Call the PI Serial Library loop
-      mqttclient.loop();
+      
       if ((haDiscTrigger || settings.data.haDiscovery) && measureJson(Json) > jsonSize)
       {
         if (sendHaDiscovery())
@@ -548,37 +606,38 @@ char *topicBuilder(char *buffer, char const *path, char const *numering = "")
   return buffer;
 }
 
+unsigned long lastMqttAttempt = 0;
+
 bool connectMQTT()
 {
-  if (strcmp(settings.data.mqttServer, "") == 0)
-    return false;
-  char buff[256];
-  if (!mqttclient.connected())
-  {
-    firstPublish = false;
-    
-    if (mqttclient.connect(mqttClientId, settings.data.mqttUser, settings.data.mqttPassword, (topicBuilder(buff, "Alive")), 0, true, "false", true))
+    if (strcmp(settings.data.mqttServer, "") == 0)
+        return false;
+
+    // schon verbunden → fertig
+    if (mqttclient.connected())
+        return true;
+
+    // nur alle 5 Sekunden versuchen
+    if (millis() - lastMqttAttempt < 5000)
+        return false;
+
+    lastMqttAttempt = millis();
+
+    if (mqttclient.connect(
+            mqttClientId,
+            settings.data.mqttUser,
+            settings.data.mqttPassword))
     {
-      if (mqttclient.connected())
-      {
-        mqttclient.publish(topicBuilder(buff, "Alive"), "true", true); // LWT online message must be retained!
-        mqttclient.publish(topicBuilder(buff, "IP"), (const char *)(WiFi.localIP().toString()).c_str(), true);
-        mqttclient.subscribe(topicBuilder(buff, "DeviceControl/Set_Command"));
-        if (strlen(settings.data.mqttTriggerPath) >= 1)
-        {
-          mqttclient.subscribe(settings.data.mqttTriggerPath);
-        }
-      }
+        writeLog("MQTT connected");
+        return true;
     }
     else
     {
-      return false; // Exit if we couldnt connect to MQTT brooker
+        writeLog("MQTT connect failed, state=%d", mqttclient.state());
+        return false;
     }
-    firstPublish = true;
-    writeLog("MQTT Client State: %d", mqttclient.state());
-  }
-  return true;
 }
+
 
 bool sendtoMQTT()
 {
@@ -589,65 +648,11 @@ bool sendtoMQTT()
     firstPublish = false;
     return false;
   }
-  if (!settings.data.mqttJson)
-  {
-    char msgBuffer1[200];
-    for (JsonPair jsonDev : Json.as<JsonObject>())
-    {
-      for (JsonPair jsondat : jsonDev.value().as<JsonObject>())
-      {
-        sprintf(msgBuffer1, "%s/%s/%s", settings.data.mqttTopic, jsonDev.key().c_str(), jsondat.key().c_str());
-        mqttclient.publish(msgBuffer1, jsondat.value().as<String>().c_str());
-      }
-    }
-    if (mppClient.get.raw.commandAnswer.length() > 0)
-    {
-      mqttclient.publish((String(settings.data.mqttTopic) + String("/DeviceControl/Set_Command_answer")).c_str(), (mppClient.get.raw.commandAnswer).c_str());
-      writeLog("raw command answer: ",mppClient.get.raw.commandAnswer);
-      mppClient.get.raw.commandAnswer = "";
-    }
-#ifdef TEMPSENS_PIN
-    for (int i = 0; i < numOfTempSens; i++)
-    {
-      if (tempSens.getAddress(tempDeviceAddress, i))
-      {
-        float tempC = tempSens.getTempC(tempDeviceAddress);
-        if (tempC != DEVICE_DISCONNECTED_C)
-        {
-          char valBuffer[8];
-          sprintf(msgBuffer1, "%s/DS18B20_%i", settings.data.mqttTopic, (i + 1));
-          mqttclient.publish(msgBuffer1, dtostrf(tempC, 4, 1, valBuffer));
-        }
-      }
-    }
-#endif
-// RAW
-    mqttclient.publish(topicBuilder(buff, "RAW/Q1"), (mppClient.get.raw.q1).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QPIGS"), (mppClient.get.raw.qpigs).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QPIGS2"), (mppClient.get.raw.qpigs2).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QPIRI"), (mppClient.get.raw.qpiri).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QT"), (mppClient.get.raw.qt).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QET"), (mppClient.get.raw.qet).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QEY"), (mppClient.get.raw.qey).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QEM"), (mppClient.get.raw.qem).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QED"), (mppClient.get.raw.qed).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QLT"), (mppClient.get.raw.qt).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QLY"), (mppClient.get.raw.qly).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QLM"), (mppClient.get.raw.qlm).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QLD"), (mppClient.get.raw.qld).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QPI"), (mppClient.get.raw.qpi).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QMOD"), (mppClient.get.raw.qmod).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QALL"), (mppClient.get.raw.qall).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QMN"), (mppClient.get.raw.qmn).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QPIWS"), (mppClient.get.raw.qpiws).c_str());
-    mqttclient.publish(topicBuilder(buff, "RAW/QFLAG"), (mppClient.get.raw.qflag).c_str());
-  }
-  else
-  {
-    mqttclient.beginPublish(topicBuilder(buff, "Data"), measureJson(Json), false);
-    serializeJson(Json, mqttclient);
-    mqttclient.endPublish();
-  }
+  
+  mqttclient.beginPublish(topicBuilder(buff, "Data"), measureJson(Json), false);
+  serializeJson(Json, mqttclient);
+  mqttclient.endPublish();
+
   mqttclient.publish(topicBuilder(buff, "Alive"), "true", true); // LWT online message must be retained!
   mqttclient.publish(topicBuilder(buff, "EspData/Wifi_RSSI"), String(WiFi.RSSI()).c_str());
   writeLog("Data sent to MQTT");
@@ -731,7 +736,8 @@ bool sendHaDiscovery()
     {
       String haPayLoad = String("{") +
                          "\"name\":\"" + haLiveDescriptor[i][0] + "\"," +
-                         "\"stat_t\":\"" + settings.data.mqttTopic + "/LiveData/" + haLiveDescriptor[i][0] + "\"," +
+                         "\"stat_t\":\"" + settings.data.mqttTopic + "/Data\"," +
+                         "\"value_template\":\"{{ value_json.LiveData." + haLiveDescriptor[i][0] + " }}\"," +
                          "\"avty_t\":\"" + settings.data.mqttTopic + "/Alive\"," +
                          "\"pl_avail\": \"true\"," +
                          "\"pl_not_avail\": \"false\"," +
