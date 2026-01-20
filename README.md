@@ -1,13 +1,15 @@
 # Solar2MQTT
 
 # Features:
-not yet uploaded. This is my first Github Project
-toDO:
+This is my first Github Project
+Changes:
 - Due to many crashes after Minutes to Days I am trying the following changes:
-- NEW: LiveData reduced only to JSON via MQTT (
-- NEW: 24h Auto Reboot
-- NEW: Refresh of Data on WebInterface only when logged in (save resources)
+- NEW: LiveData reduced only to JSON via MQTT for now to test stability.
+- NEW: no published RAW Data via MQTT to save ESP performance
+- NEW: 24h Auto Reboot to free resources
+- NEW: Refresh of Data on WebInterface only when logged in (better ESP performance)
 - NEW: !!Homeassistant needs to be tested. Not sure if it works correctly
+- ESP is up and running since 01/17/2026 with MQTT 2 second transmits
  --------------
 Thanx for the great work of softwarecrash! 
  
