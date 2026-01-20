@@ -1,6 +1,8 @@
 
 /*
-Solar2MQTT Project
+Solar2MQTT Project - Modified by AndyMuc72 (JSON, more stability)
+https://github.com/AndyMuc72/Solar2MQTT
+original project by softwarecrash
 https://github.com/softwarecrash/Solar2MQTT
 */
 
@@ -30,6 +32,17 @@ AsyncWebSocketClient *wsClient;
 DNSServer dns;
 Settings settings;
 
+// --- WebSocket Auto-Off ---
+bool websocketEnabled = false;
+unsigned long websocketStart = 0;
+const unsigned long WS_TIMEOUT = 30000; // 30 Sekunden
+const uint32_t MIN_HEAP = 5000;
+
+// --- 24h Reboot ---
+unsigned long bootTime = 0;
+const unsigned long DAILY_REBOOT = 24UL * 60UL * 60UL * 1000UL;
+
+
 #ifdef TEMPSENS_PIN
 OneWire oneWire(TEMPSENS_PIN);
 DallasTemperature tempSens(&oneWire);
@@ -42,6 +55,9 @@ uint8_t numOfTempSens;
 // new importetd
 char mqttClientId[80];
 ADC_MODE(ADC_VCC);
+
+
+
 
 // flag for saving data
 unsigned long mqtttimer = 0;
@@ -77,22 +93,34 @@ void saveConfigCallback()
 
 void notifyClients()
 {
-  if (wsClient != nullptr && wsClient->canSend())
+  if (!websocketEnabled)
+    return;
+
+  if (wsClient == nullptr || !wsClient->canSend())
+    return;
+
+  // erst jetzt: Aktivität
+  websocketStart = millis();
+
+  size_t len = measureJson(liveData);
+  AsyncWebSocketMessageBuffer *buffer = ws.makeBuffer(len);
+  if (buffer)
   {
-    size_t len = measureJson(liveData);
-    AsyncWebSocketMessageBuffer *buffer = ws.makeBuffer(len);
-    if (buffer)
-    {
-      serializeJson(liveData, (char *)buffer->get(), len + 1);
-      wsClient->text(buffer);
-    }
-    writeLog("WS data send");
+    serializeJson(liveData, (char *)buffer->get(), len + 1);
+    wsClient->text(buffer);
   }
 }
 
+
+
 void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
 {
+  // GUI ist aktiv → Timeout zurücksetzen
+  websocketStart = millis();
+
   AwsFrameInfo *info = (AwsFrameInfo *)arg;
+
+
   if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT)
   {
     data[len] = 0;
@@ -104,14 +132,19 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
   switch (type)
   {
   case WS_EVT_CONNECT:
-    wsClient = client;
-    getJsonData();
-    notifyClients();
-    break;
+      wsClient = client;
+      websocketEnabled = true;
+      websocketStart = millis();
+      getJsonData();
+      notifyClients();
+      break;
+
   case WS_EVT_DISCONNECT:
     wsClient = nullptr;
-    ws.cleanupClients(); // clean unused client connections
+    websocketEnabled = false;   // <-- wichtig
+    ws.cleanupClients();
     break;
+
   case WS_EVT_DATA:
     handleWebSocketMessage(arg, data, len);
     break;
@@ -173,8 +206,14 @@ bool resetCounter(bool count)
 
 void setup()
 {
+  
+  
   // make a compatibility mode for some crap routers?
   //WiFi.setPhyMode(WIFI_PHY_MODE_11G);
+  
+  // --- 24h Reboot ---
+  bootTime = millis();
+
   analogWrite(LED_PIN, 0);
 #ifdef isUART_HARDWARE
   analogWrite(LED_COM, 0);
@@ -450,12 +489,28 @@ void setup()
 void loop()
 {
   MDNS.update();
+  if (millis() - bootTime > DAILY_REBOOT)
+  {
+      writeLog("Daily reboot");
+      ESP.restart();
+  }
+
+  if (websocketEnabled && millis() - websocketStart > WS_TIMEOUT)
+  {
+      websocketEnabled = false;
+      ws.closeAll();
+      writeLog("WebSocket auto-off");
+  }
+
   if (Update.isRunning())
   {
     workerCanRun = false; // lockout, atfer true need reboot
   }
   if (workerCanRun)
   {
+    mqttclient.loop();
+    yield();
+    
     // Make sure wifi is in the right mode
     if (WiFi.status() == WL_CONNECTED)
     { // No use going to next step unless WIFI is up and running.
@@ -467,8 +522,7 @@ void loop()
       }
       ws.cleanupClients(); // clean unused client connections
       mppClient.loop(); // Call the PI Serial Library loop
-      mqttclient.loop();
-      yield();
+      
       if ((haDiscTrigger || settings.data.haDiscovery) && measureJson(Json) > jsonSize)
       {
         if (sendHaDiscovery())
@@ -594,47 +648,11 @@ bool sendtoMQTT()
     firstPublish = false;
     return false;
   }
-  if (!settings.data.mqttJson)
-  {
-    char msgBuffer1[200];
-    for (JsonPair jsonDev : Json.as<JsonObject>())
-    {
-      for (JsonPair jsondat : jsonDev.value().as<JsonObject>())
-      {
-        sprintf(msgBuffer1, "%s/%s/%s", settings.data.mqttTopic, jsonDev.key().c_str(), jsondat.key().c_str());
-        mqttclient.publish(msgBuffer1, jsondat.value().as<String>().c_str());
-      }
-    }
-    if (mppClient.get.raw.commandAnswer.length() > 0)
-    {
-      mqttclient.publish((String(settings.data.mqttTopic) + String("/DeviceControl/Set_Command_answer")).c_str(), (mppClient.get.raw.commandAnswer).c_str());
-      writeLog("raw command answer: ",mppClient.get.raw.commandAnswer);
-      mppClient.get.raw.commandAnswer = "";
-    }
-#ifdef TEMPSENS_PIN
-    for (int i = 0; i < numOfTempSens; i++)
-    {
-      if (tempSens.getAddress(tempDeviceAddress, i))
-      {
-        float tempC = tempSens.getTempC(tempDeviceAddress);
-        if (tempC != DEVICE_DISCONNECTED_C)
-        {
-          char valBuffer[8];
-          sprintf(msgBuffer1, "%s/DS18B20_%i", settings.data.mqttTopic, (i + 1));
-          mqttclient.publish(msgBuffer1, dtostrf(tempC, 4, 1, valBuffer));
-        }
-      }
-    }
-#endif
-// RAW
+  
+  mqttclient.beginPublish(topicBuilder(buff, "Data"), measureJson(Json), false);
+  serializeJson(Json, mqttclient);
+  mqttclient.endPublish();
 
-  }
-  else
-  {
-    mqttclient.beginPublish(topicBuilder(buff, "Data"), measureJson(Json), false);
-    serializeJson(Json, mqttclient);
-    mqttclient.endPublish();
-  }
   mqttclient.publish(topicBuilder(buff, "Alive"), "true", true); // LWT online message must be retained!
   mqttclient.publish(topicBuilder(buff, "EspData/Wifi_RSSI"), String(WiFi.RSSI()).c_str());
   writeLog("Data sent to MQTT");
@@ -718,7 +736,8 @@ bool sendHaDiscovery()
     {
       String haPayLoad = String("{") +
                          "\"name\":\"" + haLiveDescriptor[i][0] + "\"," +
-                         "\"stat_t\":\"" + settings.data.mqttTopic + "/LiveData/" + haLiveDescriptor[i][0] + "\"," +
+                         "\"stat_t\":\"" + settings.data.mqttTopic + "/Data\"," +
+                         "\"value_template\":\"{{ value_json.LiveData." + haLiveDescriptor[i][0] + " }}\"," +
                          "\"avty_t\":\"" + settings.data.mqttTopic + "/Alive\"," +
                          "\"pl_avail\": \"true\"," +
                          "\"pl_not_avail\": \"false\"," +
